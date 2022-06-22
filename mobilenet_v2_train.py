@@ -1,16 +1,80 @@
-import torch
-import cv2
+import pickle, os, cv2, random, tqdm, json
+from random import choice as r_ch
+import numpy as np
+import pandas as pd
+
 from os.path import join as join_path
 from os.path import sep as os_sep
+from os.path import exists as path_exists
+
+import matplotlib.pyplot as plt
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
 import albumentations as album
 import segmentation_models_pytorch as smp
-import numpy as np
 
-ENCODER = 'resnet101'
-ENCODER_WEIGHTS = 'imagenet'
-preprocessing_fn = smp.encoders.get_preprocessing_fn(ENCODER, ENCODER_WEIGHTS)
+from global_names import A2D2_PATH
 
-A2D2_PATH = "/home/g.leontiev/a2d2/"
+
+with open("bm_ds.pkl", "rb") as f:
+    bm_ds = pickle.load(f)
+    
+# Load files
+with open(join_path(A2D2_PATH, "camera_lidar_semantic", "class_list.json"), "rb") as f:
+     class_list= json.load(f)
+        
+
+ss_p = join_path(A2D2_PATH, "camera_lidar_semantic")
+
+sens_ext = {
+    "camera": ".png",
+    "label": ".png",
+    "lidar": ".npz"
+}
+
+rel_ = lambda __p: join_path(*__p.split(os_sep)[__p.split(os_sep).index('camera_lidar_semantic'):])
+abs_ = lambda __p: join_path(A2D2_PATH, __p)
+
+def sensor_p(_id, s_type):
+    if s_type not in sens_ext.keys(): raise ValueError("Wrong sensor type: s_type")
+    d,t,s = _id.split("_")
+    _p = "_".join([d, s_type, s, t]) + sens_ext[s_type]
+    _p = join_path(ss_p, f"{d[:8]}_{d[8:]}", s_type, f"cam_{sa_(s)}", _p)
+    return rel_(_p)
+
+def sa_(x):
+    als = ["center", "left", "right"]
+    for o in als:
+        if o in x:
+            return x.replace(o, "_" + o)
+    raise ValueError(f"Bad index contains wrong sensor align: {x}")
+
+# It's important to reduce number of images
+sparced_ids = [val for i, val in enumerate(bm_ds["train_ids"]) if i % 10 == 0]
+x_train_dir = np.array([abs_(sensor_p(p, "camera")) for p in sparced_ids])
+y_train_dir = np.array([abs_(sensor_p(p, "label")) for p in sparced_ids])
+
+# It's important to reduce number of images
+sparced_val_ids = [val for i, val in enumerate(bm_ds["val_ids"]) if i % 10 == 0]
+val_images_paths = np.array([abs_(sensor_p(p, "camera")) for p in sparced_val_ids])
+val_labels_paths = np.array([abs_(sensor_p(p, "label")) for p in sparced_val_ids])
+
+
+class_names = list(class_list.values())
+class_rgb_values = [[int(i[1:3], 16), int(i[3:5], 16), int(i[5:7], 16)] for i in class_list.keys()]
+
+# Useful to shortlist specific classes in datasets with large number of classes
+select_classes = class_names # all classes
+
+# Get RGB values of required classes
+select_class_indices = [class_names.index(cls) for cls in select_classes]
+select_class_rgb_values =  np.array(class_rgb_values)[select_class_indices]
+
 
 # helper function for data visualization
 def visualize(**images):
@@ -83,6 +147,7 @@ def colour_code_segmentation(image, label_values):
 
     return x
 
+
 class A2D2_Dataset(torch.utils.data.Dataset):
 
     """Audi Autonomous Driving Dataset. 
@@ -140,31 +205,6 @@ class A2D2_Dataset(torch.utils.data.Dataset):
         # return length of 
         return len(self.image_paths)
     
-
-ss_p = join_path(A2D2_PATH, "camera_lidar_semantic")
-
-sens_ext = {
-    "camera": ".png",
-    "label": ".png",
-    "lidar": ".npz"
-}
-
-rel_ = lambda __p: join_path(*__p.split(os_sep)[__p.split(os_sep).index('camera_lidar_semantic'):])
-abs_ = lambda __p: join_path(A2D2_PATH, __p)
-
-def sensor_p(_id, s_type):
-    if s_type not in sens_ext.keys(): raise ValueError("Wrong sensor type: s_type")
-    d,t,s = _id.split("_")
-    _p = "_".join([d, s_type, s, t]) + sens_ext[s_type]
-    _p = join_path(ss_p, f"{d[:8]}_{d[8:]}", s_type, f"cam_{sa_(s)}", _p)
-    return rel_(_p)
-
-def sa_(x):
-    als = ["center", "left", "right"]
-    for o in als:
-        if o in x:
-            return x.replace(o, "_" + o)
-    raise ValueError(f"Bad index contains wrong sensor align: {x}")
     
 def get_training_augmentation():
     train_transform = [    
@@ -207,3 +247,115 @@ def get_preprocessing(preprocessing_fn=None):
     _transform.append(album.Lambda(image=to_tensor, mask=to_tensor))
         
     return album.Compose(_transform)
+
+
+ENCODER = 'mobilenet_v2'
+ENCODER_WEIGHTS = 'imagenet'
+CLASSES = class_names
+ACTIVATION = 'sigmoid' # could be None for logits or 'softmax2d' for multiclass segmentation
+
+# create segmentation model with pretrained encoder
+model = smp.DeepLabV3Plus(
+    encoder_name=ENCODER, 
+    encoder_weights=ENCODER_WEIGHTS, 
+    classes=len(CLASSES), 
+    activation=ACTIVATION,
+)
+
+preprocessing_fn = smp.encoders.get_preprocessing_fn(ENCODER, ENCODER_WEIGHTS)
+
+
+# Get train and val dataset instances
+train_dataset = A2D2_Dataset(
+    x_train_dir, y_train_dir, 
+    # augmentation=None,
+    augmentation=get_training_augmentation(),
+    preprocessing=get_preprocessing(preprocessing_fn),
+    class_rgb_values=select_class_rgb_values,
+)
+
+valid_dataset = A2D2_Dataset(
+    val_images_paths, val_labels_paths, 
+    # augmentation=None,
+    augmentation=get_training_augmentation(),
+    preprocessing=get_preprocessing(preprocessing_fn),
+    class_rgb_values=select_class_rgb_values,
+)
+
+# Set flag to train the model or not. If set to 'False', only prediction is performed (using an older model checkpoint)
+TRAINING = True
+
+# Set device: `cuda` or `cpu`
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# define loss function
+loss = smp.utils.losses.DiceLoss()
+
+# define metrics
+metrics = [
+    smp.utils.metrics.IoU(threshold=0.5),
+]
+
+# define optimizer
+optimizer = torch.optim.Adam([ 
+    dict(params=model.parameters(), lr=0.0001),
+])
+
+# define learning rate scheduler (not used in this NB)
+lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    optimizer, T_0=1, T_mult=2, eta_min=5e-5,
+)
+
+# load best saved model checkpoint from previous commit (if present)
+if os.path.exists(f'best_{ENCODER}_model.pth'):
+    model = torch.load(f'best_{ENCODER}_model.pth', map_location=DEVICE)
+    
+
+train_epoch = smp.utils.train.TrainEpoch(
+    model, 
+    loss=loss, 
+    metrics=metrics, 
+    optimizer=optimizer,
+    device=DEVICE,
+    verbose=True,
+)
+
+valid_epoch = smp.utils.train.ValidEpoch(
+    model, 
+    loss=loss, 
+    metrics=metrics, 
+    device=DEVICE,
+    verbose=True,
+)
+
+
+# Set num of epochs
+EPOCHS = 20
+
+# Get train and val data loaders
+train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, num_workers=0)
+valid_loader = DataLoader(valid_dataset, batch_size=2, shuffle=False, num_workers=0)
+
+
+
+if TRAINING:
+
+    best_iou_score = 0.0
+    train_logs_list, valid_logs_list = [], []
+
+    for i in range(0, EPOCHS):
+
+        # Perform training & validation
+        print('\nEpoch: {}'.format(i))
+        train_logs = train_epoch.run(train_loader)
+        valid_logs = valid_epoch.run(valid_loader)
+        train_logs_list.append(train_logs)
+        valid_logs_list.append(valid_logs)
+
+        # Save model if a better val IoU score is obtained
+        if best_iou_score < valid_logs['iou_score']:
+            best_iou_score = valid_logs['iou_score']
+            torch.save(model, f'best_{ENCODER}_model.pth')
+            print('Model saved!')
+            
+
